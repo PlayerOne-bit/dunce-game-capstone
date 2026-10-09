@@ -1,0 +1,4 @@
+repository "wakai-games/wakai-games@1375612825875@cloud"
+  path "/"
+    br "/main"
+    co "/main"
