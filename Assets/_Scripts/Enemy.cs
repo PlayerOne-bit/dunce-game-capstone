@@ -1,9 +1,11 @@
 using System.Collections.Generic;
+using FishNet.Object;
+using FishNet.Object.Synchronizing;
 using TMPro;
 using UnityEngine;
 
 [RequireComponent(typeof(CharacterController))]
-public class Enemy : MonoBehaviour
+public class Enemy : NetworkBehaviour
 {
     public static readonly List<Enemy> Active = new List<Enemy>();
 

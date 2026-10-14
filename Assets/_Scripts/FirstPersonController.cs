@@ -1,9 +1,19 @@
+using System.Collections.Generic;
+using FishNet.Component.Animating;
+using FishNet.Object;
+using FishNet.Object.Synchronizing;
 using TMPro;
 using UnityEngine;
 using UnityEngine.InputSystem;
 
-public class FirstPersonController : MonoBehaviour
+[RequireComponent(typeof(CharacterController))]
+public class FirstPersonController : NetworkBehaviour
 {
+    // Server-side list of all players (enemies use this to pick targets)
+    public static readonly List<FirstPersonController> AllPlayers = new List<FirstPersonController>();
+    // The player controlled by this client (enemies use its camera for billboarding)
+    public static FirstPersonController Local { get; private set; }
+
     [Header("Camera")]
     public Camera playerCamera;
     public float mouseSensitivity = 0.1f;
@@ -15,13 +25,12 @@ public class FirstPersonController : MonoBehaviour
     [SerializeField] private float sprintMultiplier = 1.5f;
 
     [Header("Input")]
-    [SerializeField] private InputActionReference moveAction; 
+    [SerializeField] private InputActionReference moveAction;
     [SerializeField] private InputActionReference lookAction;
-    [SerializeField] private InputActionReference jumpAction; 
-    [SerializeField] private InputActionReference sprintAction; 
+    [SerializeField] private InputActionReference jumpAction;
+    [SerializeField] private InputActionReference sprintAction;
     [SerializeField] private InputActionReference typeMode;
-    [SerializeField] private InputActionReference interactAction;
-    [SerializeField] private InputActionReference submitAttack; 
+    [SerializeField] private InputActionReference submitAttack;
 
     [Header("Stats")]
     [SerializeField] private int maxLives = 3;
@@ -33,11 +42,20 @@ public class FirstPersonController : MonoBehaviour
     [Header("Typing Mode")]
     [SerializeField] private int maxCharacters = 10;
     [SerializeField] private string placeholderText = "<Enter Input>";
+    [Header("Animation")]
+    [SerializeField] private Animator animator;
+    [SerializeField] private NetworkAnimator networkAnimator;
 
-    [Header("Display")]
-    [SerializeField] private TMP_Text attackText;
-    [SerializeField] private TextMeshProUGUI staminaText;
-    [SerializeField] private TMP_Text livesText;
+    private static readonly int SpeedHash = Animator.StringToHash("Speed");
+    private static readonly int InteractHash = Animator.StringToHash("Interact");
+    private static readonly int GroundedHash = Animator.StringToHash("Grounded");
+    // Synced from server to everyone
+    private readonly SyncVar<int> _lives = new SyncVar<int>();
+
+    // Local-only UI (assigned from PlayerHUD for the owner)
+    private TMP_Text attackText;
+    private TMP_Text staminaText;
+    private TMP_Text livesText;
 
     private CharacterController controller;
     private float verticalRotation = 0f;
@@ -45,21 +63,65 @@ public class FirstPersonController : MonoBehaviour
     private bool isTypingMode = false;
     private string typedText = "";
     private int lastShownStamina = -1;
-    private int lives;
-    public bool IsAlive => lives > 0;
 
-    void OnEnable()
+    public bool IsAlive => _lives.Value > 0;
+
+    void Awake()
     {
+        if (animator == null)
+            animator = GetComponentInChildren<Animator>();
+        controller = GetComponent<CharacterController>();
+        _lives.OnChange += OnLivesChanged;
+    }
+
+    // ---------- Network lifecycle ----------
+
+    public override void OnStartServer()
+    {
+        AllPlayers.Add(this);
+        _lives.Value = maxLives;
+    }
+
+    public override void OnStopServer()
+    {
+        AllPlayers.Remove(this);
+    }
+
+    public override void OnStartClient()
+    {
+        if (!IsOwner)
+        {
+            // Remote players: no camera, no CharacterController (NetworkTransform moves them)
+            controller.enabled = false;
+            playerCamera.gameObject.SetActive(false);
+            return;
+        }
+
+        Local = this;
+
+        PlayerHUD hud = PlayerHUD.Instance;
+        attackText = hud.attackText;
+        staminaText = hud.staminaText;
+        livesText = hud.livesText;
+
         moveAction.action.Enable();
         lookAction.action.Enable();
         jumpAction.action.Enable();
         sprintAction.action.Enable();
         typeMode.action.Enable();
         submitAttack.action.Enable();
+
+        UpdateLivesText();
+        RefreshAttackText();
+        SetTypingMode(false);
     }
 
-    void OnDisable()
+    public override void OnStopClient()
     {
+        if (!IsOwner) return;
+
+        if (Local == this) Local = null;
+
         moveAction.action.Disable();
         lookAction.action.Disable();
         jumpAction.action.Disable();
@@ -71,17 +133,13 @@ public class FirstPersonController : MonoBehaviour
             Keyboard.current.onTextInput -= OnTextInput;
     }
 
-    void Start()
-    {
-        controller = GetComponent<CharacterController>();
-        lives = maxLives;
-        UpdateLivesText();
-        RefreshAttackText();
-        SetTypingMode(false);
-    }
+    // ---------- Update (owner only) ----------
 
     void Update()
     {
+        if (NetworkObject == null) return; // not a networked object
+        if (!IsOwner || !IsAlive) return;
+
         HandleTypeMode();
         HandleLook();
         HandleMovement();
@@ -126,20 +184,19 @@ public class FirstPersonController : MonoBehaviour
         UpdateStaminaText();
 
         if (controller.isGrounded && verticalVelocity < 0f)
-        {
             verticalVelocity = -2f;
-        }
 
         bool jumpPressed = !isTypingMode && jumpAction.action.WasPressedThisFrame();
         if (controller.isGrounded && jumpPressed)
-        {
             verticalVelocity = Mathf.Sqrt(jumpHeight * -2f * gravity);
-        }
 
         verticalVelocity += gravity * Time.deltaTime;
 
         Vector3 velocity = move * moveSpeed + Vector3.up * verticalVelocity;
         controller.Move(velocity * Time.deltaTime);
+        animator.SetBool(GroundedHash, controller.isGrounded);
+        Vector3 horizontal = new Vector3(controller.velocity.x, 0f, controller.velocity.z);
+        animator.SetFloat(SpeedHash, horizontal.magnitude, 0.1f, Time.deltaTime);
     }
 
     void UpdateStaminaText()
@@ -151,35 +208,59 @@ public class FirstPersonController : MonoBehaviour
         staminaText.SetText($"Stamina {shown}");
     }
 
+    // ---------- Typing / attacking ----------
+
     void HandleTypeMode()
     {
-        if (typeMode.action.WasPressedThisFrame())
+        bool togglePressed = typeMode.action.WasPressedThisFrame();
+        bool submitPressed = submitAttack.action.WasPressedThisFrame();
+
+        if (isTypingMode && (submitPressed || togglePressed))
+            SubmitAttack();
+
+        if (togglePressed)
         {
             SetTypingMode(!isTypingMode);
-        }
-
-        if (isTypingMode && submitAttack.action.WasPressedThisFrame())
-        {
-            SubmitAttack();
+            networkAnimator.SetTrigger(InteractHash);
         }
     }
+
     void SubmitAttack()
     {
         string attempt = typedText.Trim();
         if (attempt.Length == 0) return;
 
-        foreach (Enemy enemy in Enemy.Active)
-        {
-            if (string.Equals(enemy.Word, attempt, System.StringComparison.OrdinalIgnoreCase))
-            {
-                Destroy(enemy.gameObject);
-                break;
-            }
-        }
+        SubmitAttackServer(attempt); // server decides if it hits
 
         typedText = "";
         RefreshAttackText();
     }
+
+    [ServerRpc] // owner-only by default
+    void SubmitAttackServer(string attempt)
+    {
+        if (!IsAlive || string.IsNullOrEmpty(attempt) || attempt.Length > maxCharacters) return;
+
+        Enemy nearest = null;
+        float nearestDistSqr = float.MaxValue;
+
+        foreach (Enemy enemy in Enemy.Active)
+        {
+            if (!string.Equals(enemy.Word, attempt, System.StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            float distSqr = (enemy.transform.position - transform.position).sqrMagnitude;
+            if (distSqr < nearestDistSqr)
+            {
+                nearestDistSqr = distSqr;
+                nearest = enemy;
+            }
+        }
+
+        if (nearest != null)
+            nearest.NetworkObject.Despawn(); // replaces Destroy()
+    }
+
     void SetTypingMode(bool on)
     {
         isTypingMode = on;
@@ -203,7 +284,7 @@ public class FirstPersonController : MonoBehaviour
 
     void OnTextInput(char c)
     {
-        if (c == '\b') 
+        if (c == '\b')
         {
             if (typedText.Length > 0)
                 typedText = typedText.Substring(0, typedText.Length - 1);
@@ -221,25 +302,27 @@ public class FirstPersonController : MonoBehaviour
         attackText.SetText(typedText.Length == 0 ? placeholderText : typedText.ToUpper());
     }
 
-    public string Attack()
-    {
-        return typedText;
-    }
+    // ---------- Lives ----------
+
+    [Server]
     public void TakeDamage(int amount)
     {
         if (!IsAlive) return;
 
-        lives = Mathf.Clamp(lives - amount, 0, maxLives);
-        UpdateLivesText();
+        _lives.Value = Mathf.Clamp(_lives.Value - amount, 0, maxLives);
 
-        if (lives == 0)
-        {
-            Debug.Log("Game Over"); 
-        }
+        if (_lives.Value == 0)
+            Debug.Log($"Player {OwnerId} is out");
+    }
+
+    void OnLivesChanged(int prev, int next, bool asServer)
+    {
+        if (IsOwner && livesText != null)
+            UpdateLivesText();
     }
 
     void UpdateLivesText()
     {
-        livesText.SetText($"Lives {lives}");
+        livesText.SetText($"Lives {_lives.Value}");
     }
 }
