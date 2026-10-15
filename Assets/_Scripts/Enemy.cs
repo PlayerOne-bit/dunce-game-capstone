@@ -10,7 +10,6 @@ public class Enemy : NetworkBehaviour
     public static readonly List<Enemy> Active = new List<Enemy>();
 
     [Header("Word")]
-    [SerializeField] private string word;
     [SerializeField] private TMP_Text wordText;
 
     [Header("Chase")]
@@ -21,37 +20,48 @@ public class Enemy : NetworkBehaviour
     [SerializeField] private int damage = 1;
     [SerializeField] private float attackCooldown = 3f;
 
+    private readonly SyncVar<string> _word = new SyncVar<string>();
     private CharacterController controller;
-    private FirstPersonController player;
     private float nextAttackTime = 0f;
 
-    public string Word => word;
+    public string Word => _word.Value;
 
     void Awake()
     {
         controller = GetComponent<CharacterController>();
+        _word.OnChange += OnWordChanged;
     }
 
     void OnEnable() => Active.Add(this);
     void OnDisable() => Active.Remove(this);
 
-    void Start()
+    public override void OnStartClient()
     {
-        player = FindFirstObjectByType<FirstPersonController>();
-        if (wordText != null) wordText.SetText(word);
+        // Pure clients only display; the server moves the enemy and NetworkTransform copies it
+        if (!IsServerStarted) controller.enabled = false;
+
+        wordText.SetText(_word.Value);
     }
 
+    // Call this before spawning so the word is part of the initial state
     public void SetWord(string newWord)
     {
-        word = newWord;
-        if (wordText != null) wordText.SetText(word);
+        _word.Value = newWord;
+    }
+
+    void OnWordChanged(string prev, string next, bool asServer)
+    {
+        if (wordText != null) wordText.SetText(next);
     }
 
     void Update()
     {
-        if (player == null || !player.IsAlive) return;
+        if (!IsServerStarted) return; // only the server runs the AI
 
-        Vector3 toPlayer = player.transform.position - transform.position;
+        FirstPersonController target = FindNearestPlayer();
+        if (target == null) return;
+
+        Vector3 toPlayer = target.transform.position - transform.position;
         toPlayer.y = 0f;
         float distance = toPlayer.magnitude;
 
@@ -64,14 +74,36 @@ public class Enemy : NetworkBehaviour
         }
         else if (Time.time >= nextAttackTime)
         {
-            player.TakeDamage(damage);
+            target.TakeDamage(damage);
             nextAttackTime = Time.time + attackCooldown;
         }
     }
 
+    FirstPersonController FindNearestPlayer()
+    {
+        FirstPersonController nearest = null;
+        float best = float.MaxValue;
+
+        foreach (FirstPersonController p in FirstPersonController.AllPlayers)
+        {
+            if (!p.IsAlive) continue;
+
+            float d = (p.transform.position - transform.position).sqrMagnitude;
+            if (d < best)
+            {
+                best = d;
+                nearest = p;
+            }
+        }
+        return nearest;
+    }
+
     void LateUpdate()
     {
-        if (wordText == null || player == null) return;
-        wordText.transform.rotation = player.playerCamera.transform.rotation;
+        // Every screen turns the word toward its own local camera
+        FirstPersonController local = FirstPersonController.Local;
+        if (wordText == null || local == null) return;
+
+        wordText.transform.rotation = local.playerCamera.transform.rotation;
     }
 }

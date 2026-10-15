@@ -1,4 +1,4 @@
-repository "wakai-games/wakai-games@1375612825875@cloud"
+repository "Dunce Game Capstone/Dunce Game Capstone@18968522073321@cloud"
   path "/"
     br "/main"
     co "/main"

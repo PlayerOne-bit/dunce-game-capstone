@@ -214,14 +214,14 @@ public class FirstPersonController : NetworkBehaviour
     {
         bool togglePressed = typeMode.action.WasPressedThisFrame();
         bool submitPressed = submitAttack.action.WasPressedThisFrame();
-
         if (isTypingMode && (submitPressed || togglePressed))
+        {
             SubmitAttack();
-
+        }
         if (togglePressed)
         {
             SetTypingMode(!isTypingMode);
-            networkAnimator.SetTrigger(InteractHash);
+            animator.SetBool(InteractHash, isTypingMode);
         }
     }
 
@@ -317,8 +317,12 @@ public class FirstPersonController : NetworkBehaviour
 
     void OnLivesChanged(int prev, int next, bool asServer)
     {
-        if (IsOwner && livesText != null)
-            UpdateLivesText();
+        if (!IsOwner) return;
+
+        if (livesText != null) UpdateLivesText();
+
+        if (next == 0 && isTypingMode)
+            SetTypingMode(false);
     }
 
     void UpdateLivesText()
